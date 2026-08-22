@@ -1,0 +1,326 @@
+name: Publish CogLintPlugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      cog_version:
+        description: Published Cog version to mirror as CogLintPlugins
+        required: true
+        type: string
+
+concurrency:
+  group: coglint-release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Prepare generated package
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      cog_sha: ${{ steps.prepare.outputs.cog_sha }}
+      sibling_sha: ${{ steps.prepare.outputs.sibling_sha }}
+      artifact_name: ${{ steps.prepare.outputs.artifact_name }}
+    steps:
+      - name: Check out the exact Cog release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: skeswa/cog
+          ref: ${{ inputs.cog_version }}
+          path: cog
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the published Cog release, tag, assets, and provenance
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.cog_version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid Cog version::${VERSION} is not a bare semantic version"
+            exit 1
+          fi
+          ref="$(gh api "repos/skeswa/cog/git/ref/tags/${VERSION}")"
+          if [ "$(jq -r .object.type <<<"$ref")" != commit ]; then
+            echo "::error title=Mutable Cog release::${VERSION} is not a lightweight commit tag"
+            exit 1
+          fi
+          cog_sha="$(jq -r .object.sha <<<"$ref")"
+          if [ "$(git -C cog rev-parse HEAD)" != "$cog_sha" ] || \
+             [ "$(tr -d '[:space:]' < cog/version.txt)" != "$VERSION" ]; then
+            echo "::error title=Cog checkout mismatch::tag, checkout, and version.txt disagree"
+            exit 1
+          fi
+
+          release="$(gh api "repos/skeswa/cog/releases/tags/${VERSION}")"
+          if [ "$(jq -r .draft <<<"$release")" != false ] || \
+             [ "$(jq -r .prerelease <<<"$release")" != false ]; then
+            echo "::error title=Cog release is not published::${VERSION} is draft or prerelease"
+            exit 1
+          fi
+
+          mkdir -p release-assets
+          for name in \
+            CogLintBinary.artifactbundle.zip \
+            CogLintBinary.artifactbundle.zip.checksum \
+            CogLintBinary.artifactbundle.zip.provenance.json; do
+            asset_id="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .id' <<<"$release")"
+            case "$asset_id" in
+              ''|*[!0-9]*) echo "::error title=Cog release asset missing::${name}"; exit 1 ;;
+            esac
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/skeswa/cog/releases/assets/${asset_id}" > "release-assets/${name}"
+          done
+
+          archive="release-assets/CogLintBinary.artifactbundle.zip"
+          checksum="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          if [ "$(tr -d '[:space:]' < "${archive}.checksum")" != "$checksum" ]; then
+            echo "::error title=Cog asset checksum mismatch::published archive and checksum disagree"
+            exit 1
+          fi
+          cog_tree="$(git -C cog rev-parse 'HEAD^{tree}')"
+          jq -e \
+            --arg version "$VERSION" \
+            --arg tree "$cog_tree" \
+            --arg checksum "$checksum" \
+            '.format == "coglint-candidate-v2" and
+             .version == $version and
+             .source_tree == $tree and
+             .checksum == $checksum and
+             .architectures == ["arm64", "x86_64"] and
+             .build.runner == "self-hosted-cog-mini" and
+             .build.xcode_version == "26.6" and
+             .build.xcode_build == "17F113" and
+             (.build.swift_version | contains("Apple Swift version 6.3.3")) and
+             .build.arm64_probe == "passed" and
+             .intel.runner == "macos-15-intel" and
+             .intel.architecture == "x86_64" and
+             .intel.xcode_version == "26.3" and
+             .intel.xcode_build == "17C529" and
+             (.intel.swift_version | length > 0) and
+             .intel.x86_64_probe == "passed"' "${archive}.provenance.json"
+
+          sibling_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          artifact_name="coglint-plugins-${VERSION}-${cog_sha}"
+          echo "cog_sha=${cog_sha}" >> "$GITHUB_OUTPUT"
+          echo "sibling_sha=${sibling_sha}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${checksum}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate the version-matched sibling package
+        env:
+          VERSION: ${{ inputs.cog_version }}
+          CHECKSUM: ${{ steps.prepare.outputs.checksum }}
+        run: |
+          node cog/tools/generate-coglint-plugins.mjs \
+            --version "$VERSION" \
+            --output "$GITHUB_WORKSPACE/generated" \
+            --checksum "$CHECKSUM"
+          swift package --package-path generated dump-package > /dev/null
+          jq -e \
+            --arg version "$VERSION" \
+            --arg checksum "$CHECKSUM" \
+            '.version == $version and .checksum == $checksum' \
+            generated/.coglint-generation.json
+
+      - name: Run the pre-publication SwiftPM consumer smoke test
+        env:
+          GENERATED: ${{ github.workspace }}/generated
+        run: |
+          set -euo pipefail
+          consumer="$(mktemp -d)"
+          mkdir -p "${consumer}/Sources/Consumer"
+          printf '%s\n' 'public enum ConsumerMarker {}' > "${consumer}/Sources/Consumer/Consumer.swift"
+          printf '%s\n' \
+            '// swift-tools-version:6.2' \
+            'import PackageDescription' \
+            'let package = Package(' \
+            '  name: "Consumer",' \
+            "  dependencies: [.package(path: \"${GENERATED}\")]," \
+            '  targets: [' \
+            '    .target(' \
+            '      name: "Consumer",' \
+            '      plugins: [.plugin(name: "CogLintBuildToolPlugin", package: "generated")]' \
+            '    )' \
+            '  ]' \
+            ')' > "${consumer}/Package.swift"
+          swift build --package-path "$consumer"
+
+      - name: Record and upload the verified generated tree
+        env:
+          VERSION: ${{ inputs.cog_version }}
+          COG_SHA: ${{ steps.prepare.outputs.cog_sha }}
+          SIBLING_SHA: ${{ steps.prepare.outputs.sibling_sha }}
+          ARTIFACT_NAME: ${{ steps.prepare.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          tree_hash="$(cd generated && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+          mkdir -p publication
+          jq -n \
+            --arg version "$VERSION" \
+            --arg cog_sha "$COG_SHA" \
+            --arg sibling_sha "$SIBLING_SHA" \
+            --arg tree_hash "$tree_hash" \
+            '{
+              format: "coglint-plugins-publication-v1",
+              version: $version,
+              cog_sha: $cog_sha,
+              sibling_main_sha: $sibling_sha,
+              generated_tree_hash: $tree_hash
+            }' > publication/provenance.json
+          jq . publication/provenance.json
+
+      - name: Retain the generated package for protected publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.prepare.outputs.artifact_name }}
+          path: |
+            generated
+            publication/provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish generated package
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: coglint-release
+    permissions:
+      contents: write
+    outputs:
+      commit_sha: ${{ steps.verify.outputs.commit_sha || steps.publish.outputs.commit_sha }}
+    steps:
+      - name: Check out the unchanged sibling main branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+
+      - name: Download the prepared generated tree
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          path: prepared
+
+      - name: Reverify without executing downloaded repository code
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.cog_version }}
+          COG_SHA: ${{ needs.prepare.outputs.cog_sha }}
+          SIBLING_SHA: ${{ needs.prepare.outputs.sibling_sha }}
+        run: |
+          set -euo pipefail
+          provenance="prepared/publication/provenance.json"
+          generated="prepared/generated"
+          current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "$current_sha" != "$SIBLING_SHA" ] || [ "$(git rev-parse HEAD)" != "$SIBLING_SHA" ]; then
+            echo "::error title=Sibling main moved::prepare at ${SIBLING_SHA}, current main is ${current_sha}"
+            exit 1
+          fi
+          tree_hash="$(cd "$generated" && find . -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | awk '{print $1}')"
+          jq -e \
+            --arg version "$VERSION" \
+            --arg cog_sha "$COG_SHA" \
+            --arg sibling_sha "$SIBLING_SHA" \
+            --arg tree_hash "$tree_hash" \
+            '.format == "coglint-plugins-publication-v1" and
+             .version == $version and
+             .cog_sha == $cog_sha and
+             .sibling_main_sha == $sibling_sha and
+             .generated_tree_hash == $tree_hash' "$provenance"
+          jq -e --arg version "$VERSION" '.version == $version' "$generated/.coglint-generation.json"
+
+          current_version="$(jq -r .version .coglint-generation.json)"
+          existing_tag="$(git ls-remote --tags origin "refs/tags/${VERSION}" | awk '{print $1}')"
+          if [ -n "$existing_tag" ]; then
+            if [ "$existing_tag" != "$SIBLING_SHA" ] || [ "$current_version" != "$VERSION" ]; then
+              echo "::error title=Divergent immutable sibling tag::${VERSION} resolves to ${existing_tag}, main is ${SIBLING_SHA} at ${current_version}"
+              exit 1
+            fi
+            drift="$(rsync -ani --delete --exclude=.git --exclude=.github prepared/generated/ ./)"
+            if [ -n "$drift" ]; then
+              echo "::error title=Divergent published sibling tree::${VERSION} is tagged but its managed tree differs from regeneration"
+              exit 1
+            fi
+            echo "The immutable ${VERSION} tag and generated main tree already match; publication is complete."
+            echo "commit_sha=${SIBLING_SHA}" >> "$GITHUB_OUTPUT"
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$current_version" = "$VERSION" ]; then
+            echo "::error title=Divergent sibling version::main already claims ${VERSION} without its immutable tag"
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$current_version" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            echo "::error title=Sibling version regression::refusing to replace ${current_version} with ${VERSION}"
+            exit 1
+          fi
+          echo "already_published=false" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, fast-forward main, and create the immutable tag
+        id: publish
+        if: steps.verify.outputs.already_published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.cog_version }}
+        run: |
+          set -euo pipefail
+          rsync -a --delete --exclude=.git --exclude=.github prepared/generated/ ./
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit -m "chore(release): publish CogLintPlugins ${VERSION}"
+          commit_sha="$(git rev-parse HEAD)"
+          git tag "$VERSION" "$commit_sha"
+          gh auth setup-git
+          git push --atomic origin HEAD:main "refs/tags/${VERSION}"
+          echo "commit_sha=${commit_sha}" >> "$GITHUB_OUTPUT"
+
+  consume:
+    name: Consume published sibling tag
+    needs: publish
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve and build a public exact-version consumer
+        env:
+          VERSION: ${{ inputs.cog_version }}
+        run: |
+          set -euo pipefail
+          consumer="$(mktemp -d)"
+          mkdir -p "${consumer}/Sources/Consumer"
+          printf '%s\n' 'public enum ConsumerMarker {}' > "${consumer}/Sources/Consumer/Consumer.swift"
+          printf '%s\n' \
+            '// swift-tools-version:6.2' \
+            'import PackageDescription' \
+            'let package = Package(' \
+            '  name: "Consumer",' \
+            "  dependencies: [.package(url: \"https://github.com/skeswa/coglint-plugins.git\", exact: \"${VERSION}\")]," \
+            '  targets: [' \
+            '    .target(' \
+            '      name: "Consumer",' \
+            '      plugins: [.plugin(name: "CogLintBuildToolPlugin", package: "coglint-plugins")]' \
+            '    )' \
+            '  ]' \
+            ')' > "${consumer}/Package.swift"
+          for _ in $(seq 1 12); do
+            if swift package --package-path "$consumer" resolve && swift build --package-path "$consumer"; then
+              exit 0
+            fi
+            rm -rf "${consumer}/.build" "${consumer}/Package.resolved"
+            sleep 10
+          done
+          echo "::error title=Published sibling unavailable::${VERSION} did not resolve and execute"
+          exit 1
