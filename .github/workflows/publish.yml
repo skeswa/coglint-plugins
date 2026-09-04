@@ -136,6 +136,7 @@ jobs:
             'import PackageDescription' \
             'let package = Package(' \
             '  name: "Consumer",' \
+            '  platforms: [.macOS(.v14)],' \
             "  dependencies: [.package(path: \"${GENERATED}\")]," \
             '  targets: [' \
             '    .target(' \
@@ -301,6 +302,7 @@ jobs:
             'import PackageDescription' \
             'let package = Package(' \
             '  name: "Consumer",' \
+            '  platforms: [.macOS(.v14)],' \
             "  dependencies: [.package(url: \"https://github.com/skeswa/coglint-plugins.git\", exact: \"${VERSION}\")]," \
             '  targets: [' \
             '    .target(' \
