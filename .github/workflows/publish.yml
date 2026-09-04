@@ -84,6 +84,9 @@ jobs:
             echo "::error title=Cog asset checksum mismatch::published archive and checksum disagree"
             exit 1
           fi
+          # Identity only. Which runner, Xcode, and Swift may build a candidate
+          # is Cog's publisher's policy, enforced there before the release is
+          # public; a copy here can only drift, and did.
           cog_tree="$(git -C cog rev-parse 'HEAD^{tree}')"
           jq -e \
             --arg version "$VERSION" \
@@ -94,16 +97,7 @@ jobs:
              .source_tree == $tree and
              .checksum == $checksum and
              .architectures == ["arm64", "x86_64"] and
-             .build.runner == "self-hosted-cog-mini" and
-             .build.xcode_version == "26.6" and
-             .build.xcode_build == "17F113" and
-             (.build.swift_version | contains("Apple Swift version 6.3.3")) and
              .build.arm64_probe == "passed" and
-             .intel.runner == "macos-15-intel" and
-             .intel.architecture == "x86_64" and
-             .intel.xcode_version == "26.3" and
-             .intel.xcode_build == "17C529" and
-             (.intel.swift_version | length > 0) and
              .intel.x86_64_probe == "passed"' "${archive}.provenance.json"
 
           sibling_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
