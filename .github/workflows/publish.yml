@@ -204,11 +204,14 @@ jobs:
           persist-credentials: false
           ref: main
 
+      # The prepared tree lives outside the checkout. Syncing it into the
+      # repository root with --delete would otherwise treat its own download
+      # directory as extraneous and delete the source mid-transfer.
       - name: Download the prepared generated tree
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.prepare.outputs.artifact_name }}
-          path: prepared
+          path: ${{ runner.temp }}/prepared
 
       - name: Reverify without executing downloaded repository code
         id: verify
@@ -219,8 +222,8 @@ jobs:
           SIBLING_SHA: ${{ needs.prepare.outputs.sibling_sha }}
         run: |
           set -euo pipefail
-          provenance="prepared/publication/provenance.json"
-          generated="prepared/generated"
+          provenance="${RUNNER_TEMP}/prepared/publication/provenance.json"
+          generated="${RUNNER_TEMP}/prepared/generated"
           current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
           if [ "$current_sha" != "$SIBLING_SHA" ] || [ "$(git rev-parse HEAD)" != "$SIBLING_SHA" ]; then
             echo "::error title=Sibling main moved::prepare at ${SIBLING_SHA}, current main is ${current_sha}"
@@ -246,7 +249,7 @@ jobs:
               echo "::error title=Divergent immutable sibling tag::${VERSION} resolves to ${existing_tag}, main is ${SIBLING_SHA} at ${current_version}"
               exit 1
             fi
-            drift="$(rsync -ani --delete --exclude=.git --exclude=.github prepared/generated/ ./)"
+            drift="$(rsync -ani --delete --exclude=.git --exclude=.github "${generated}/" ./)"
             if [ -n "$drift" ]; then
               echo "::error title=Divergent published sibling tree::${VERSION} is tagged but its managed tree differs from regeneration"
               exit 1
@@ -274,7 +277,7 @@ jobs:
           VERSION: ${{ inputs.cog_version }}
         run: |
           set -euo pipefail
-          rsync -a --delete --exclude=.git --exclude=.github prepared/generated/ ./
+          rsync -a --delete --exclude=.git --exclude=.github "${RUNNER_TEMP}/prepared/generated/" ./
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
