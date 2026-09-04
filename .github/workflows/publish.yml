@@ -17,7 +17,7 @@ permissions: {}
 jobs:
   prepare:
     name: Prepare generated package
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     permissions:
       contents: read
@@ -283,7 +283,7 @@ jobs:
   consume:
     name: Consume published sibling tag
     needs: publish
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
     permissions:
       contents: read
