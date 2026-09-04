@@ -13,8 +13,8 @@ let package = Package(
   targets: [
     .binaryTarget(
       name: "CogLintBinary",
-      url: "https://github.com/skeswa/cog/releases/download/0.4.0/CogLintBinary.artifactbundle.zip",
-      checksum: "0dbcf7166769ed8e34b9f70597af6fc93b7df422e1ab713dcdce0cff56181877"
+      url: "https://github.com/skeswa/cog/releases/download/0.7.0/CogLintBinary.artifactbundle.zip",
+      checksum: "6bed1e92825ce2681a3bd04ed08de16a1492fb70a01911c8ab4669daa9fb46de"
     ),
     .plugin(
       name: "CogLintBuildToolPlugin",
